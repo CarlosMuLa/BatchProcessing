@@ -56,7 +56,7 @@ class SparkUtils:
             "timestamp": TimestampType(),
             "binary": BinaryType(),
             "array_int": ArrayType(IntegerType()),
-            "array_string": ArrayType(StringType()),
+            "array_string": ArrayType(ArrayType(StringType())),
             "struct": StructType()
         }
 
