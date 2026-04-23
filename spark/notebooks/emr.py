@@ -2,8 +2,6 @@ from spark_utils import SparkUtils
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 su = SparkUtils()
-# show the data
-
 
 column_types = [("timestamp_received", "long"),
                 ("timestamp_created_at", "long"),
@@ -23,7 +21,7 @@ order_book = SparkUtils.generate_schema(column_types)
 order_book_df = su._spark \
                 .read \
                 .schema(order_book) \
-                .parquet("/opt/spark/work-dir/data/orderbooks/")
+                .parquet("s3://batch-processingcml/orderbook/")
 
 from pyspark.sql import functions as F
 column_types = [("timestamp_received", "long"),
@@ -45,7 +43,7 @@ json_data = [
 
 
 snapshots_schema = SparkUtils.generate_schema(column_types)
-snapshots= su._spark.read.schema(snapshots_schema).parquet("/opt/spark/work-dir/data/snapshots/")
+snapshots= su._spark.read.schema(snapshots_schema).parquet("s3://batch-processingcml/snapshots/")
 
 json_data = SparkUtils.generate_schema(json_data)
 
@@ -76,7 +74,7 @@ targets_schema = SparkUtils.generate_schema(column_types)
 targets = (
     su._spark.read
     .schema(targets_schema)
-    .parquet("/opt/spark/work-dir/data/labels/targets/")
+    .parquet("s3://batch-processingcml/labels/targets/")
     .drop("category", "target")
     .withColumn(
         "uma_status",
@@ -94,8 +92,13 @@ column_types = [("condition_id", "string"),
 
 trades_schema = SparkUtils.generate_schema(column_types)
 
-trades = su._spark.read.schema(trades_schema).parquet("/opt/spark/work-dir/data/labels/trades/")
+trades = su._spark.read.schema(trades_schema).parquet("s3://batch-processingcml/labels/trades/")
 
+#print number of records in each dataframe
+print(f"Order Book records: {order_book_df.count()}")
+print(f"Snapshots records: {snapshots.count()}")
+print(f"Targets records: {targets.count()}")
+print(f"Trades records: {trades.count()}")
 
 # 1) Expandimos targets a nivel token para unir con trades.asset
 labels_by_token = (
@@ -265,7 +268,7 @@ whales_antes = (
     .withColumn("rn", F.row_number().over(w_before))
     .filter(F.col("rn") == 1)
     .drop("rn")
-    .alias("wa")  # <--- AQUÍ SE RENOMBRÓ TODO A "wa"
+    .alias("wa")
 )
 
 # 4. FOTO DESPUÉS: Ventana de 10s DESPUÉS del trade
@@ -295,7 +298,6 @@ recuperacion_10s = impact_analysis.filter(F.col("rn_10s") == 1).select(
     F.col("wa.trade_id"), F.col("oba.mid_price").alias("mid_price_10s")
 )
 
-# 5. Unir todo y calcular impacto (CORREGIDO: usando wa.mid_price)
 reporte_final = (
     whales_antes
     .join(impacto_inmediato, "trade_id", "left")
@@ -307,8 +309,7 @@ reporte_final = (
     .withColumn("trade_time", F.to_timestamp(F.from_unixtime(F.col("wa.trade_ts_ms") / 1000)))
 )
 
-# 6. Mostrar resultados
-reporte_final.select(
+reportefinal = reporte_final.select(
     "trade_time",
     F.substring("wa.question", 1, 40).alias("question"), 
     "wa.side",
@@ -317,4 +318,17 @@ reporte_final.select(
     F.round("mid_price_post", 4).alias("mid_DESPUES"),
     F.round("mid_price_10s", 4).alias("mid_10_SEGS"),
     F.round("impacto_bps", 2).alias("impacto_bps")
-).orderBy(F.col("wa.trade_notional").desc()).show(20, truncate=False)
+).orderBy(F.col("wa.trade_notional").desc())
+
+reportefinal.show(20, truncate=False)
+
+reportes3 = reportefinal.withColumn("year", F.year("trade_time")) \
+                        .withColumn("month", F.month("trade_time"))
+
+(
+    reportes3
+    .write
+    .mode("overwrite")
+    .partitionBy("year", "month") 
+    .parquet("s3a://batch-processingcml/reports/bigfish/") 
+)
