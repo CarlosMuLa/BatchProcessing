@@ -1,4 +1,4 @@
-from spark_utils import SparkUtils
+from emr_spark_utils import SparkUtils
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 su = SparkUtils()
@@ -6,7 +6,7 @@ su = SparkUtils()
 column_types = [("timestamp_received", "long"),
                 ("timestamp_created_at", "long"),
                 ("market_id", "string"),
-                ("best_bid", "double"),
+                ("best_bid", "float"),
                 ("best_ask", "float"),
                 ("change_price", "float"),
                 ("change_size", "float"),
@@ -85,8 +85,8 @@ targets = (
 column_types = [("condition_id", "string"),
                 ("side", "string"),
                 ("outcome", "string"),
-                ("price", "double"),
-                ("size", "double"),
+                ("price", "float"),
+                ("size", "float"),
                 ("timestamp", "long"),
                 ("asset", "string")]
 
@@ -200,6 +200,8 @@ with_features = (
     .withColumn("trade_time", F.to_timestamp(F.from_unixtime(F.col("t.trade_ts_ms") / 1000)))
 )
 
+
+
 # 5) Vista agregada: mercados con peor/mejor ejecución
 summary = (
     with_features
@@ -214,24 +216,33 @@ summary = (
     .orderBy(F.col("notional").desc_nulls_last())
 )
 
-summary.show(30, truncate=False)
 
 # Inspección de trades concretos
-with_features.select(
-    "trade_time",
-    "label_condition_id",
-    "question",
-    "label_outcome",
-    F.col("t.side").alias("trade_side"),
-    F.col("t.price").alias("trade_price"),
-    F.col("t.size").alias("trade_size"),
-    "ob.best_bid",
-    "ob.best_ask",
-    "ob.mid_price",
-    "ob.spread",
-    "slippage_bps",
-    "edge_vs_mid"
-).orderBy(F.col("trade_time").desc()).show(20, truncate=False)
+
+# 1. Extraemos año y mes antes de agrupar
+with_features_time = with_features.withColumn("year", F.year("trade_time")) \
+                                  .withColumn("month", F.month("trade_time"))
+
+summary_mensual = (
+    with_features_time
+    .groupBy("label_condition_id", "question", "label_outcome", "year", "month")
+    .agg(
+        F.count("*").alias("n_trades"),
+        F.round(F.sum("trade_notional"), 2).alias("notional"),
+        F.round(F.avg("ob.spread"), 6).alias("avg_spread"),
+        F.round(F.avg("slippage_bps"), 2).alias("avg_slippage_bps"),
+        F.round(F.avg("edge_vs_mid"), 6).alias("avg_edge_vs_mid")
+    )
+    .orderBy(F.col("year").desc(), F.col("month").desc(), F.col("notional").desc())
+)
+
+(
+    summary_mensual
+    .write
+    .mode("overwrite") 
+    .partitionBy("year", "month")
+    .parquet("s3://batch-processingcml/reports/resumen_mercados/")
+)
 
 
 trades_clean = (
@@ -320,7 +331,6 @@ reportefinal = reporte_final.select(
     F.round("impacto_bps", 2).alias("impacto_bps")
 ).orderBy(F.col("wa.trade_notional").desc())
 
-reportefinal.show(20, truncate=False)
 
 reportes3 = reportefinal.withColumn("year", F.year("trade_time")) \
                         .withColumn("month", F.month("trade_time"))
@@ -330,5 +340,5 @@ reportes3 = reportefinal.withColumn("year", F.year("trade_time")) \
     .write
     .mode("overwrite")
     .partitionBy("year", "month") 
-    .parquet("s3a://batch-processingcml/reports/bigfish/") 
+    .parquet("s3://batch-processingcml/reports/bigfish/") 
 )
