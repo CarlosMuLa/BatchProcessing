@@ -7,7 +7,6 @@ class SparkUtils:
     def __init__(self, master_url="spark://spark-master:7077", app_name="helloworld",spark_jars=None,spark_packages=None):
             builder = (SparkSession.builder
                 .appName(app_name)
-                .master(master_url)
                 .config("spark.ui.port", "4040"))
 
             if spark_jars is not None:
