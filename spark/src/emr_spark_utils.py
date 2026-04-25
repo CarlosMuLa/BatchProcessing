@@ -16,7 +16,7 @@ class SparkUtils:
                 builder = builder.config("spark.jars.packages", spark_packages)
 
             self._spark = builder.getOrCreate()
-            self._spark.conf.set("spark.sql.shuffle.partitions", "5")
+            self._spark.conf.set("spark.sql.shuffle.partitions", "500")
     def __repr__(self):
         return str(self._spark.sparkContext)
 
