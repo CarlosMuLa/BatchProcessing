@@ -61,7 +61,6 @@ snapshots = (
     .withColumn("asks", F.col("data_parsed.asks"))
     .drop("data", "data_parsed")
 )
-#show data column
 column_types = [("condition_id", "string"),
                 ("question", "string"),
                 ("end_date", "string"),
@@ -102,7 +101,6 @@ print(f"Snapshots records: {snapshots.count()}")
 print(f"Targets records: {targets.count()}")
 print(f"Trades records: {trades.count()}")
 
-# 1) Expandimos targets a nivel token para unir con trades.asset
 
 
 trades_clean = (
@@ -119,11 +117,9 @@ trades_clean = (
 # Filtrar ballenas (mayor a $5,000)
 whale_trades = trades_clean.filter(F.col("trade_notional") >= 5000.0).alias("wt")
 
-# 2. Agregar contexto usando targets (solo la pregunta)
 targets_min = targets.select("condition_id", "question").dropDuplicates().alias("tgt")
 whales_with_q = whale_trades.join(broadcast(targets_min), F.col("wt.condition_id") == F.col("tgt.condition_id"), "left").alias("wq")
 
-# 3. FOTO ANTES: Precio justo ANTES del trade
 ob_before = order_book_df.alias("obb")
 join_before = whales_with_q.join(
     ob_before,
@@ -133,7 +129,6 @@ join_before = whales_with_q.join(
     "left"
 )
 
-# Quedarnos solo con el registro más reciente antes del trade y ponerle alias "wa"
 w_before = Window.partitionBy("wq.trade_id").orderBy(F.col("obb.timestamp_received").desc_nulls_last())
 whales_antes = (
     join_before
@@ -143,7 +138,6 @@ whales_antes = (
     .alias("wa")
 )
 
-# 4. FOTO DESPUÉS: Ventana de 10s DESPUÉS del trade
 ob_after = order_book_df.alias("oba")
 join_after = whales_antes.join(
     ob_after,
