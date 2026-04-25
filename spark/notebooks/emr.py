@@ -1,6 +1,7 @@
 from emr_spark_utils import SparkUtils
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+from pyspark.sql.functions import broadcast
 su = SparkUtils()
 
 column_types = [("timestamp_received", "long"),
@@ -21,7 +22,8 @@ order_book = SparkUtils.generate_schema(column_types)
 order_book_df = su._spark \
                 .read \
                 .schema(order_book) \
-                .parquet("s3://batch-processingcml/orderbook/")
+                .parquet("s3://batch-processingcml/orderbook/") \
+                .select("token_id", "timestamp_received", "best_bid", "best_ask", "mid_price", "spread")
 
 from pyspark.sql import functions as F
 column_types = [("timestamp_received", "long"),
@@ -101,148 +103,6 @@ print(f"Targets records: {targets.count()}")
 print(f"Trades records: {trades.count()}")
 
 # 1) Expandimos targets a nivel token para unir con trades.asset
-labels_by_token = (
-    targets.select(
-        F.col("condition_id").alias("label_condition_id"),
-        "question",
-        "end_date",
-        "closed",
-        "uma_status",
-        "liquidity",
-        F.col("clob_token_id_yes").alias("token_id"),
-        F.lit("Yes").alias("label_outcome")
-    )
-    .unionByName(
-        targets.select(
-            F.col("condition_id").alias("label_condition_id"),
-            "question",
-            "end_date",
-            "closed",
-            "uma_status",
-            "liquidity",
-            F.col("clob_token_id_no").alias("token_id"),
-            F.lit("No").alias("label_outcome")
-        )
-    )
-)
-
-# 2) Normalizamos timestamp de trade a ms (algunos vienen en segundos)
-tr = (
-    trades
-    .withColumn(
-        "trade_ts_ms",
-        F.when(F.length(F.col("timestamp").cast("string")) <= 10, F.col("timestamp") * 1000)
-         .otherwise(F.col("timestamp"))
-    )
-    .withColumn("trade_id", F.monotonically_increasing_id())
-    .alias("tr")
-)
-
-lb = labels_by_token.alias("lb")
-
-trades_enriched = (
-    tr.join(lb, F.col("tr.asset") == F.col("lb.token_id"), "left")
-      .select(
-          F.col("tr.*"),
-          F.col("lb.label_condition_id"),
-          F.col("lb.question"),
-          F.col("lb.end_date"),
-          F.col("lb.closed"),
-          F.col("lb.uma_status"),
-          F.col("lb.liquidity"),
-          F.col("lb.label_outcome")
-      )
-)
-
-# 3) Join temporal con order_book_df: último estado de libro antes del trade (hasta 10 min hacia atrás)
-ob = order_book_df.alias("ob")
-t = trades_enriched.alias("t")
-
-joined = (
-    t.join(
-        ob,
-        (F.col("t.asset") == F.col("ob.token_id")) &
-        (F.col("ob.timestamp_received") <= F.col("t.trade_ts_ms")) &
-        (F.col("ob.timestamp_received") >= F.col("t.trade_ts_ms") - F.lit(10 * 60 * 1000)),
-        "left"
-    )
-)
-
-w = Window.partitionBy("t.trade_id").orderBy(F.col("ob.timestamp_received").desc_nulls_last())
-
-joined_latest = (
-    joined
-    .withColumn("rn", F.row_number().over(w))
-    .filter(F.col("rn") == 1)
-    .drop("rn")
-)
-
-# 4) Features de microestructura por trade
-with_features = (
-    joined_latest
-    .withColumn(
-        "ref_price",
-        F.when(F.col("t.side") == "BUY", F.col("ob.best_ask")).otherwise(F.col("ob.best_bid"))
-    )
-    .withColumn(
-        "slippage_bps",
-        F.when(
-            F.col("ref_price").isNotNull() & (F.col("ref_price") > 0),
-            (F.col("t.price") - F.col("ref_price")) / F.col("ref_price") * F.lit(10000.0)
-        )
-    )
-    .withColumn(
-        "edge_vs_mid",
-        F.when(F.col("t.side") == "BUY", F.col("ob.mid_price") - F.col("t.price"))
-         .otherwise(F.col("t.price") - F.col("ob.mid_price"))
-    )
-    .withColumn("trade_notional", F.col("t.price") * F.col("t.size"))
-    .withColumn("trade_time", F.to_timestamp(F.from_unixtime(F.col("t.trade_ts_ms") / 1000)))
-)
-
-
-
-# 5) Vista agregada: mercados con peor/mejor ejecución
-summary = (
-    with_features
-    .groupBy("label_condition_id", "question", "label_outcome")
-    .agg(
-        F.count("*").alias("n_trades"),
-        F.round(F.sum("trade_notional"), 2).alias("notional"),
-        F.round(F.avg("ob.spread"), 6).alias("avg_spread"),
-        F.round(F.avg("slippage_bps"), 2).alias("avg_slippage_bps"),
-        F.round(F.avg("edge_vs_mid"), 6).alias("avg_edge_vs_mid")
-    )
-    .orderBy(F.col("notional").desc_nulls_last())
-)
-
-
-# Inspección de trades concretos
-
-# 1. Extraemos año y mes antes de agrupar
-with_features_time = with_features.withColumn("year", F.year("trade_time")) \
-                                  .withColumn("month", F.month("trade_time"))
-
-summary_mensual = (
-    with_features_time
-    .groupBy("label_condition_id", "question", "label_outcome", "year", "month")
-    .agg(
-        F.count("*").alias("n_trades"),
-        F.round(F.sum("trade_notional"), 2).alias("notional"),
-        F.round(F.avg("ob.spread"), 6).alias("avg_spread"),
-        F.round(F.avg("slippage_bps"), 2).alias("avg_slippage_bps"),
-        F.round(F.avg("edge_vs_mid"), 6).alias("avg_edge_vs_mid")
-    )
-    .orderBy(F.col("year").desc(), F.col("month").desc(), F.col("notional").desc())
-)
-
-(
-    summary_mensual
-    .write
-    .mode("overwrite") 
-    .partitionBy("year", "month")
-    .parquet("s3://batch-processingcml/reports/resumen_mercados/")
-)
 
 
 trades_clean = (
@@ -261,14 +121,15 @@ whale_trades = trades_clean.filter(F.col("trade_notional") >= 5000.0).alias("wt"
 
 # 2. Agregar contexto usando targets (solo la pregunta)
 targets_min = targets.select("condition_id", "question").dropDuplicates().alias("tgt")
-whales_with_q = whale_trades.join(targets_min, F.col("wt.condition_id") == F.col("tgt.condition_id"), "left").alias("wq")
+whales_with_q = whale_trades.join(broadcast(targets_min), F.col("wt.condition_id") == F.col("tgt.condition_id"), "left").alias("wq")
 
 # 3. FOTO ANTES: Precio justo ANTES del trade
 ob_before = order_book_df.alias("obb")
 join_before = whales_with_q.join(
     ob_before,
     (F.col("wq.asset") == F.col("obb.token_id")) &
-    (F.col("obb.timestamp_received") <= F.col("wq.trade_ts_ms")),
+    (F.col("obb.timestamp_received") <= F.col("wq.trade_ts_ms")) &
+    (F.col("obb.timestamp_received") >= F.col("wq.trade_ts_ms") - F.lit(60 * 1000)),
     "left"
 )
 
